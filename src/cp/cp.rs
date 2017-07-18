@@ -26,7 +26,10 @@ use std::str::FromStr;
 use uucore::fs::{canonicalize, CanonicalizeMode};
 use walkdir::WalkDir;
 
+#[cfg(unix)] use std::os::unix::fs::symlink as symlink_file;
 #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
+
+#[cfg(windows)] use std::os::windows::fs::symlink_file;
 
 quick_error! {
     #[derive(Debug)]
@@ -103,8 +106,6 @@ macro_rules! prompt_yes(
 );
 
 pub type CopyResult<T> = Result<T, Error>;
-pub type Source = PathBuf;
-pub type Target = PathBuf;
 
 /// Specifies whether when overwrite files
 #[derive (Clone, Eq, PartialEq)]
@@ -415,7 +416,7 @@ pub fn uumain(args: Vec<String>) -> i32 {
 
     let (sources, target) = crash_if_err!(EXIT_ERR, parse_path_args(&paths, &options));
 
-    if let Err(error) = copy(&sources, &target, &options) {
+    if let Err(error) = copy(&sources, target, &options) {
         match error {
             // Error::NotAllFilesCopied is non-fatal, but the error
             // code should still be EXIT_ERR as does GNU cp
@@ -449,6 +450,24 @@ impl OverwriteMode {
             OverwriteMode::NoClobber
         } else {
             OverwriteMode::Clobber(ClobberMode::from_matches(matches))
+        }
+    }
+
+    fn verify<P: AsRef<Path>>(&self, path: P) -> CopyResult<()> {
+        let path = path.as_ref();
+
+        match *self {
+            OverwriteMode::NoClobber => {
+                Err(Error::Skipped(format!("Not overwriting {} because of option '{}'", path.display(), OPT_NO_CLOBBER)))
+            },
+            OverwriteMode::Interactive(_) => {
+                if prompt_yes!("{}: overwrite {}? ", executable!(), path.display()) {
+                    Ok(())
+                } else {
+                    Err(Error::Skipped(format!("Not overwriting {} at user request", path.display())))
+                }
+            },
+            OverwriteMode::Clobber(_) => Ok(()),
         }
     }
 }
@@ -563,14 +582,13 @@ impl Options {
     }
 }
 
-
 impl TargetType {
     /// Return TargetType required for `target`.
     ///
     /// Treat target as a dir if we have multiple sources or the target
     /// exists and already is a directory
-    fn determine(sources: &[Source], target: &Target) -> TargetType {
-        if sources.len() > 1 || target.is_dir() {
+    fn determine<P: AsRef<Path>>(sources: &[P], target: P) -> TargetType {
+        if sources.len() > 1 || target.as_ref().is_dir() {
             TargetType::Directory
         } else {
             TargetType::File
@@ -580,7 +598,8 @@ impl TargetType {
 
 
 /// Returns tuple of (Source paths, Target)
-fn parse_path_args(path_args: &[String], options: &Options) -> CopyResult<(Vec<Source>, Target)> {
+fn parse_path_args(path_args: &[String], options: &Options) -> CopyResult<(Vec<PathBuf>, PathBuf)>
+{
     let mut paths = path_args.iter().map(PathBuf::from).collect::<Vec<_>>();
 
     if paths.len() < 1 {
@@ -619,7 +638,12 @@ fn parse_path_args(path_args: &[String], options: &Options) -> CopyResult<(Vec<S
 /// Behavior depends on `options`, see [`Options`] for details.
 ///
 /// [`Options`]: ./struct.Options.html
-fn copy(sources: &[Source], target: &Target, options: &Options) -> CopyResult<()> {
+fn copy<P>(sources: &[P], target: P, options: &Options) -> CopyResult<()>
+    where P: AsRef<Path>
+{
+    let target = target.as_ref();
+    let sources = &sources.iter().map(P::as_ref).collect::<Vec<_>>();
+
     let target_type = TargetType::determine(sources, target);
     verify_target_type(target, &target_type)?;
 
@@ -627,10 +651,12 @@ fn copy(sources: &[Source], target: &Target, options: &Options) -> CopyResult<()
     let mut seen_sources = HashSet::with_capacity(sources.len());
 
     for source in sources {
+        let source: &Path = source.as_ref();
+
         if seen_sources.contains(source) {
             show_warning!("source '{}' specified more than once", source.display());
 
-        } else if let Err(error) = copy_source(source, target, &target_type, options) {
+        } else if let Err(error) = copy_source(source, target.as_ref(), &target_type, options) {
             show_error!("{}", error);
             match error {
                 Error::Skipped(_) => (),
@@ -648,9 +674,16 @@ fn copy(sources: &[Source], target: &Target, options: &Options) -> CopyResult<()
 }
 
 
-fn construct_dest_path(source_path: &Path, target: &Target, target_type: &TargetType, options: &Options)
-                       -> CopyResult<PathBuf>
+fn construct_dest_path<P>(
+    source_path: P,
+    target: P,
+    target_type: &TargetType,
+    options: &Options
+) -> CopyResult<PathBuf>
+    where P: AsRef<Path>
 {
+    let (source_path, target) = (source_path.as_ref(), target.as_ref());
+
     if options.no_target_dir && target.is_dir() {
         return Err(format!("cannot overwrite directory '{}' with non-directory", target.display()).into())
     }
@@ -664,18 +697,18 @@ fn construct_dest_path(source_path: &Path, target: &Target, target_type: &Target
     })
 }
 
-fn copy_source(source: &Source, target: &Target, target_type: &TargetType, options: &Options)
-               -> CopyResult<()>
+fn copy_source<P>(source: P, target: P, target_type: &TargetType, options: &Options) -> CopyResult<()>
+    where P: AsRef<Path>
 {
-    let source_path = Path::new(&source);
+    let (source, target) = (source.as_ref(), target.as_ref());
 
-    if source_path.is_dir() {
+    if source.is_dir() {
         // Copy as directory
         copy_directory(source, target, options)
     } else {
         // Copy as file
-        let dest = construct_dest_path(source_path, target, target_type, options)?;
-        copy_file(source_path, dest.as_path(), options)
+        let dest = construct_dest_path(source, target, target_type, options)?;
+        copy_file(source.as_ref(), dest.as_path(), options)
     }
 }
 
@@ -685,12 +718,14 @@ fn copy_source(source: &Source, target: &Target, target_type: &TargetType, optio
 ///
 /// Any errors encounted copying files in the tree will be logged but
 /// will not cause a short-circuit.
-fn copy_directory(root: &Path, target: &Target, options: &Options) -> CopyResult<()> {
+fn copy_directory<P>(root: P, target: P, options: &Options) -> CopyResult<()>
+    where P: AsRef<Path>
+{
     if !options.recursive {
-        return Err(format!("omitting directory '{}'", root.display()).into());
+        return Err(format!("omitting directory '{}'", root.as_ref().display()).into());
     }
 
-    let root_path = Path::new(&root).canonicalize()?;
+    let root_path = root.as_ref().canonicalize()?;
     let root_parent = root_path.parent();
 
     for path in WalkDir::new(root) {
@@ -700,7 +735,7 @@ fn copy_directory(root: &Path, target: &Target, options: &Options) -> CopyResult
             None         => path.clone(),
         };
 
-        let local_to_target = target.join(&local_to_root_parent);
+        let local_to_target = target.as_ref().join(&local_to_root_parent);
 
         if path.is_dir() && !local_to_target.exists() {
             or_continue!(fs::create_dir_all(local_to_target.clone()));
@@ -712,28 +747,12 @@ fn copy_directory(root: &Path, target: &Target, options: &Options) -> CopyResult
     Ok(())
 }
 
+fn copy_attribute<P>(source: P, dest: P, attribute: &Attribute) -> CopyResult<()>
+    where P: AsRef<Path>
+{
+    let (source, dest) = (source.as_ref(), dest.as_ref());
 
-impl OverwriteMode {
-    fn verify(&self, path: &Path) -> CopyResult<()> {
-        match *self {
-            OverwriteMode::NoClobber => {
-                Err(Error::Skipped(format!("Not overwriting {} because of option '{}'", path.display(), OPT_NO_CLOBBER)))
-            },
-            OverwriteMode::Interactive(_) => {
-                if prompt_yes!("{}: overwrite {}? ", executable!(), path.display()) {
-                    Ok(())
-                } else {
-                    Err(Error::Skipped(format!("Not overwriting {} at user request", path.display())))
-                }
-            },
-            OverwriteMode::Clobber(_) => Ok(()),
-        }
-    }
-}
-
-
-fn copy_attribute(source: &Path, dest: &Path, attribute: &Attribute) -> CopyResult<()> {
-    let context = &*format!("'{}' -> '{}'", source.display().to_string(), dest.display());
+    let context = &*context_for(source, dest);
     Ok(match *attribute {
         #[cfg(unix)]
         Attribute::Mode => {
@@ -753,32 +772,30 @@ fn copy_attribute(source: &Path, dest: &Path, attribute: &Attribute) -> CopyResu
     })
 }
 
-#[cfg(not(windows))]
-fn symlink_file(source: &Path, dest: &Path, context: &str) -> CopyResult<()> {
-    Ok(std::os::unix::fs::symlink(source, dest).context(context)?)
-}
-
-#[cfg(windows)]
-fn symlink_file(source: &Path, dest: &Path, context: &str) -> CopyResult<()> {
-    Ok(std::os::windows::fs::symlink_file(source, dest).context(context)?)
-}
-
-fn context_for(src: &Path, dest: &Path) -> String {
-    format!("'{}' -> '{}'", src.display(), dest.display())
+fn context_for<P>(src: P, dest: P) -> String
+    where P: AsRef<Path>
+{
+    format!("'{}' -> '{}'", src.as_ref().display(), dest.as_ref().display())
 }
 
 /// Implements a relatively naive backup that is not as full featured
 /// as GNU cp.  No CONTROL version control method argument is taken
 /// for backups.
 /// TODO: Add version control methods
-fn backup_file(path: &Path, suffix: &str) -> CopyResult<PathBuf> {
-    let mut backup_path = path.to_path_buf().into_os_string();
-    backup_path.push(suffix);
+fn backup_file<P>(path: P, suffix: P) -> CopyResult<PathBuf>
+    where P: AsRef<Path>
+{
+    let mut backup_path = path.as_ref().to_path_buf().into_os_string();
+    backup_path.push(suffix.as_ref());
     fs::copy(path, &backup_path)?;
     Ok(backup_path.into())
 }
 
-fn handle_existing_dest(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
+fn handle_existing_dest<P>(source: P, dest: P, options: &Options) -> CopyResult<()>
+    where P: AsRef<Path>
+{
+    let (source, dest) = (source.as_ref(), dest.as_ref());
+
     if paths_refer_to_same_file(source, dest)? {
         return Err(format!("{}: same file", context_for(source, dest)).into());
     }
@@ -786,7 +803,7 @@ fn handle_existing_dest(source: &Path, dest: &Path, options: &Options) -> CopyRe
     options.overwrite.verify(dest)?;
 
     if options.backup {
-        backup_file(dest, &options.backup_suffix)?;
+        backup_file(dest, options.backup_suffix.as_ref())?;
     }
 
     match options.overwrite {
@@ -813,7 +830,11 @@ fn handle_existing_dest(source: &Path, dest: &Path, options: &Options) -> CopyRe
 ///
 /// The original permissions of `source` will be copied to `dest`
 /// after a successful copy.
-fn copy_file(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
+fn copy_file<P>(source: P, dest: P, options: &Options) -> CopyResult<()>
+    where P: AsRef<Path>
+{
+    let (source, dest) = (source.as_ref(), dest.as_ref());
+
     if dest.exists() {
         handle_existing_dest(source, dest, options)?;
     }
@@ -825,7 +846,7 @@ fn copy_file(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
     match options.copy_mode {
         CopyMode::Link    => { fs::hard_link(source, dest).context(&*context_for(source, dest))?; },
         CopyMode::Copy    => { fs::copy(source, dest).context(&*context_for(source, dest))?; },
-        CopyMode::SymLink => { symlink_file(source, dest, &*context_for(source, dest))?; },
+        CopyMode::SymLink => { symlink_file(source, dest).context(&*context_for(source, dest))?; },
         CopyMode::Sparse  => return Err(Error::NotImplemented(OPT_SPARSE.to_string())),
     };
 
@@ -838,7 +859,10 @@ fn copy_file(source: &Path, dest: &Path, options: &Options) -> CopyResult<()> {
 
 
 /// Generate an error message if `target` is not the correct `target_type`
-pub fn verify_target_type(target: &Path, target_type: &TargetType) -> CopyResult<()> {
+pub fn verify_target_type<P>(target: P, target_type: &TargetType) -> CopyResult<()>
+    where P: AsRef<Path>
+{
+    let target = target.as_ref();
     match (target_type, target.is_dir()) {
         (&TargetType::Directory, false) => {
             Err(format!("target: '{}' is not a directory", target.display()).into())
@@ -862,13 +886,17 @@ pub fn verify_target_type(target: &Path, target_type: &TargetType) -> CopyResult
 ///     &Path::new("target/"),
 /// ).unwrap() == Path::new("target/c.txt"))
 /// ```
-pub fn localize_to_target(root: &Path, source: &Path, target: &Path) -> CopyResult<PathBuf> {
-    let local_to_root = source.strip_prefix(&root)?;
-    Ok(target.join(&local_to_root))
+pub fn localize_to_target<P>(root: P, source: P, target: P) -> CopyResult<PathBuf>
+    where P: AsRef<Path>
+{
+    let local_to_root = source.as_ref().strip_prefix(&root)?;
+    Ok(target.as_ref().join(&local_to_root))
 }
 
 
-pub fn paths_refer_to_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
+pub fn paths_refer_to_same_file<P>(p1: P, p2: P) -> io::Result<bool>
+    where P: AsRef<Path>
+{
     // We have to take symlinks and relative paths into account.
     let pathbuf1 = try!(canonicalize(p1, CanonicalizeMode::Normal));
     let pathbuf2 = try!(canonicalize(p2, CanonicalizeMode::Normal));
